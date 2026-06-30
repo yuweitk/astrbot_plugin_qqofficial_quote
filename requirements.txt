@@ -1,0 +1,2 @@
+# AstrBot 插件依赖
+# 本插件不引入额外依赖,所有功能基于 AstrBot 自带的 botpy 和 astrbot 核心库

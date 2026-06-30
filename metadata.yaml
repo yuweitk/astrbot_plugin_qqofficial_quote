@@ -1,0 +1,10 @@
+name: astrbot_plugin_qqofficial_quote
+display_name: QQ官方引用消息适配
+desc: 为 QQ 官方机器人适配器(qq_official / qq_official_webhook)补全群聊/私聊引用消息(回复消息)的解析能力,将 QQ 平台推送的 msg_elements 转换为 AstrBot 标准 Reply 组件,使机器人能感知用户引用了什么内容。
+version: v0.1.0
+author: yuweitk
+repo: https://github.com/yuweitk/astrbot_plugin_qqofficial_quote
+support_platforms:
+  - qq_official
+  - qq_official_webhook
+astrbot_version: ">=4.26.0"
