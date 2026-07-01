@@ -272,6 +272,11 @@ def _extract_asr_from_attachments(raw_attachments: list | None) -> list[str]:
     for att in raw_attachments:
         if not isinstance(att, dict):
             continue
+        # 调试：打印每个附件的所有字段名
+        logger.info(
+            f"[qqofficial_quote] attachment keys: {list(att.keys())}, "
+            f"content_type={att.get('content_type', 'N/A')}"
+        )
         # 检查是否是语音附件
         ct = str(att.get("content_type", "") or "").lower()
         filename = str(att.get("filename", "") or att.get("name", "") or "")
@@ -283,6 +288,11 @@ def _extract_asr_from_attachments(raw_attachments: list | None) -> list[str]:
 
         # 提取 QQ 内置 ASR 文本
         asr_text = str(att.get("asr_refer_text", "") or "").strip()
+        logger.info(
+            f"[qqofficial_quote] voice attachment: ct={ct}, filename={filename}, "
+            f"asr_refer_text={'有' if asr_text else '无'}({asr_text[:80]}), "
+            f"voice_wav_url={'有' if att.get('voice_wav_url') else '无'}"
+        )
         if asr_text:
             transcripts.append(asr_text)
 
@@ -402,8 +412,46 @@ def _patch_connection_state_parsers() -> None:
                 if msg_id and d.get("msg_elements"):
                     _store_quoted_elements(str(msg_id), d.get("msg_elements"))
                 # 捕获原始 attachments(含 asr_refer_text / voice_wav_url)
-                if msg_id and d.get("attachments"):
-                    _store_raw_attachments(str(msg_id), d.get("attachments"))
+                raw_atts = d.get("attachments")
+                if msg_id and raw_atts:
+                    # 调试日志：打印原始 attachments 结构
+                    import json as _json
+                    try:
+                        atts_summary = []
+                        for a in (raw_atts if isinstance(raw_atts, list) else []):
+                            if isinstance(a, dict):
+                                atts_summary.append({
+                                    k: (str(v)[:80] if v else v)
+                                    for k, v in a.items()
+                                })
+                        if atts_summary:
+                            logger.info(
+                                f"[qqofficial_quote] {name} raw attachments: "
+                                f"{_json.dumps(atts_summary, ensure_ascii=False)}"
+                            )
+                    except Exception:
+                        logger.info(
+                            f"[qqofficial_quote] {name} raw attachments (raw): "
+                            f"{str(raw_atts)[:500]}"
+                        )
+                    _store_raw_attachments(str(msg_id), raw_atts)
+                # 同时检查 msg_elements 中是否含语音/ASR信息
+                if msg_id and d.get("msg_elements"):
+                    me = d.get("msg_elements")
+                    if isinstance(me, list):
+                        for elem in me:
+                            if isinstance(elem, dict):
+                                ea = elem.get("attachments")
+                                if ea and isinstance(ea, list):
+                                    for a in ea:
+                                        if isinstance(a, dict):
+                                            asr = a.get("asr_refer_text", "")
+                                            if asr:
+                                                logger.info(
+                                                    f"[qqofficial_quote] {name} "
+                                                    f"found asr_refer_text in msg_elements: "
+                                                    f"{str(asr)[:100]}"
+                                                )
                 return orig(self, payload)
 
             wrapped_parser._qq_quote_patched = True  # type: ignore[attr-defined]
@@ -473,6 +521,10 @@ def _patch_parse_from_qqofficial() -> None:
         # 2. 处理当前消息的 QQ 内置 ASR(直接语音消息,非引用)
         raw_atts = _pop_raw_attachments(msg_id)
         if raw_atts:
+            logger.info(
+                f"[qqofficial_quote] msg_id={msg_id} "
+                f"raw_attachments count={len(raw_atts)}"
+            )
             asr_transcripts = _extract_asr_from_attachments(raw_atts)
             if asr_transcripts:
                 # 将 ASR 文本追加到消息链和 message_str
