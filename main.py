@@ -1,22 +1,26 @@
 """
-AstrBot 插件: QQ 官方引用消息适配
+AstrBot 插件: QQ 官方引用消息适配 + QQ内置ASR语音识别
 
 在不修改 AstrBot 源码的前提下,通过 monkey-patch 补全 QQ 官方适配器
-(qq_official / qq_official_webhook)对群聊/私聊引用消息(回复消息)的解析能力。
+(qq_official / qq_official_webhook)的两项能力:
 
-原理
-----
-QQ 官方 API 在用户回复(引用)消息时,推送的 payload 中:
-  - message_type = 103
-  - 被引用消息的内容和附件放在 msg_elements 字段中
+1. 引用消息(回复消息)解析
+   QQ 官方 API 在用户回复(引用)消息时,推送的 payload 中:
+     - message_type = 103
+     - 被引用消息的内容和附件放在 msg_elements 字段中
+   但 botpy SDK 的消息类使用 __slots__ 限定字段,没有保存 msg_elements,
+   导致这些数据在 SDK 层面就被丢弃了。
 
-但 botpy SDK 的消息类使用 __slots__ 限定字段,没有保存 message_type 和 msg_elements,
-导致这些数据在 SDK 层面就被丢弃了。
+2. QQ内置ASR语音识别 (asr_refer_text)
+   QQ 平台对语音消息免费提供腾讯ASR转写结果(asr_refer_text 字段),
+   以及预转WAV URL(voice_wav_url 字段)。
+   但 botpy 的 _Attachments 类 __slots__ 不含这两个字段,同样被丢弃。
+   本插件捕获原始 payload 中的这些字段,将转写文本注入消息链。
 
-本插件通过三层 patch 解决该问题:
-  1. patch botpy ConnectionState 的 parser —— WebSocket 模式下捕获 msg_elements
-  2. patch QQOfficialWebhook.handle_callback —— Webhook 模式下捕获 msg_elements
-  3. patch QQOfficialPlatformAdapter._parse_from_qqofficial —— 构造 Reply 组件并注入消息链
+本插件通过三层 patch 解决问题:
+  1. patch botpy ConnectionState 的 parser —— 捕获 msg_elements + 原始attachments
+  2. patch QQOfficialWebhook.handle_callback —— Webhook 模式同样捕获
+  3. patch QQOfficialPlatformAdapter._parse_from_qqofficial —— 构造Reply + 注入ASR文本
 
 参考实现: https://github.com/NousResearch/hermes-agent (gateway/platforms/qqbot)
 """
@@ -35,13 +39,17 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import BaseMessageComponent, Reply
 
 # ====================================================================
-# 模块级引用消息缓存
+# 模块级缓存 —— 引用消息 + 原始附件(含ASR)
 # ====================================================================
-# message_id -> msg_elements (list[dict])
-# botpy parser 在解析 payload 时会丢弃 msg_elements 字段,
-# 我们在 patched parser 中提前捕获并缓存,供 _parse_from_qqofficial 查询。
+# message_id -> {msg_elements, raw_attachments}
+# msg_elements: 引用消息的内容(含被引用消息的文本/附件/asr_refer_text)
+# raw_attachments: 当前消息的原始附件列表(含 asr_refer_text / voice_wav_url)
+# botpy parser 在解析 payload 时会丢弃这些字段,
+# 我们在 patched parser 中提前捕获并缓存。
 _quoted_msg_cache: dict[str, list] = {}
 _quoted_msg_timestamps: dict[str, float] = {}
+_raw_attachments_cache: dict[str, list] = {}
+_raw_attachments_timestamps: dict[str, float] = {}
 _cache_lock = threading.Lock()
 _CACHE_TTL = 300  # 秒
 _CACHE_MAX_SIZE = 500
@@ -66,21 +74,52 @@ def _pop_quoted_elements(message_id: str) -> list | None:
         return _quoted_msg_cache.pop(message_id, None)
 
 
+def _store_raw_attachments(message_id: str, attachments: list | None) -> None:
+    """缓存原始附件列表(含 asr_refer_text / voice_wav_url)。"""
+    if not message_id or not attachments:
+        return
+    with _cache_lock:
+        _raw_attachments_cache[message_id] = attachments
+        _raw_attachments_timestamps[message_id] = time.monotonic()
+        _evict_expired_locked()
+
+
+def _pop_raw_attachments(message_id: str) -> list | None:
+    """取出并移除缓存的原始附件(一次性消费)。"""
+    if not message_id:
+        return None
+    with _cache_lock:
+        _raw_attachments_timestamps.pop(message_id, None)
+        return _raw_attachments_cache.pop(message_id, None)
+
+
 def _evict_expired_locked() -> None:
     """清理超过 TTL 的缓存条目(调用方需持有锁)。"""
-    if len(_quoted_msg_cache) <= _CACHE_MAX_SIZE:
+    total = len(_quoted_msg_cache) + len(_raw_attachments_cache)
+    if total <= _CACHE_MAX_SIZE:
         return
     now = time.monotonic()
+    # 清理引用消息缓存
     expired = [
         mid for mid, ts in _quoted_msg_timestamps.items() if now - ts > _CACHE_TTL
     ]
     for mid in expired:
         _quoted_msg_cache.pop(mid, None)
         _quoted_msg_timestamps.pop(mid, None)
+    # 清理原始附件缓存
+    expired2 = [
+        mid for mid, ts in _raw_attachments_timestamps.items() if now - ts > _CACHE_TTL
+    ]
+    for mid in expired2:
+        _raw_attachments_cache.pop(mid, None)
+        _raw_attachments_timestamps.pop(mid, None)
     # 如果清理后仍超限,直接清空最旧的一半
-    if len(_quoted_msg_cache) > _CACHE_MAX_SIZE:
+    total = len(_quoted_msg_cache) + len(_raw_attachments_cache)
+    if total > _CACHE_MAX_SIZE:
         _quoted_msg_cache.clear()
         _quoted_msg_timestamps.clear()
+        _raw_attachments_cache.clear()
+        _raw_attachments_timestamps.clear()
 
 
 # ====================================================================
@@ -207,6 +246,76 @@ def _parse_quoted_message(msg_elements: list | None) -> Reply | None:
 
 
 # ====================================================================
+# QQ 内置 ASR 语音识别
+# ====================================================================
+
+
+def _extract_asr_from_attachments(raw_attachments: list | None) -> list[str]:
+    """从原始附件列表中提取 QQ 内置 ASR 转写文本。
+
+    QQ 平台对语音消息免费提供腾讯ASR转写结果(asr_refer_text 字段),
+    但 botpy 的 _Attachments 类 __slots__ 不含此字段,导致被丢弃。
+
+    Args:
+        raw_attachments: 原始 payload 中的 attachments 列表(list[dict])
+
+    Returns:
+        转写文本列表(每个语音附件一条)
+    """
+    if not raw_attachments or not isinstance(raw_attachments, list):
+        return []
+
+    transcripts: list[str] = []
+    audio_exts = {".mp3", ".wav", ".ogg", ".m4a", ".amr", ".silk"}
+    audio_cts = ("voice", "audio")
+
+    for att in raw_attachments:
+        if not isinstance(att, dict):
+            continue
+        # 检查是否是语音附件
+        ct = str(att.get("content_type", "") or "").lower()
+        filename = str(att.get("filename", "") or att.get("name", "") or "")
+        ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        is_voice = ct.startswith(audio_cts) or ext in audio_exts
+        if not is_voice:
+            continue
+
+        # 提取 QQ 内置 ASR 文本
+        asr_text = str(att.get("asr_refer_text", "") or "").strip()
+        if asr_text:
+            transcripts.append(asr_text)
+
+    return transcripts
+
+
+def _extract_asr_from_msg_elements(msg_elements: list | None) -> list[str]:
+    """从引用消息的 msg_elements 中提取被引用语音消息的 ASR 文本。
+
+    当用户引用一条语音消息时,msg_elements 中的 attachments 可能包含
+    被引用语音的 asr_refer_text。
+
+    Args:
+        msg_elements: 引用消息的 msg_elements 字段
+
+    Returns:
+        转写文本列表
+    """
+    if not msg_elements or not isinstance(msg_elements, list):
+        return []
+
+    transcripts: list[str] = []
+    for elem in msg_elements:
+        if not isinstance(elem, dict):
+            continue
+        eatts = elem.get("attachments")
+        if isinstance(eatts, list):
+            transcripts.extend(_extract_asr_from_attachments(eatts))
+
+    return transcripts
+
+
+# ====================================================================
 # Monkey-Patch 引擎
 # ====================================================================
 
@@ -292,6 +401,9 @@ def _patch_connection_state_parsers() -> None:
                 msg_id = d.get("id")
                 if msg_id and d.get("msg_elements"):
                     _store_quoted_elements(str(msg_id), d.get("msg_elements"))
+                # 捕获原始 attachments(含 asr_refer_text / voice_wav_url)
+                if msg_id and d.get("attachments"):
+                    _store_raw_attachments(str(msg_id), d.get("attachments"))
                 return orig(self, payload)
 
             wrapped_parser._qq_quote_patched = True  # type: ignore[attr-defined]
@@ -327,8 +439,9 @@ def _patch_parse_from_qqofficial() -> None:
     async def patched_parse(message, message_type, force_group_mention=False):
         abm = await original_parse(message, message_type, force_group_mention)
 
-        # 查询缓存获取引用消息的 msg_elements
         msg_id = str(getattr(abm, "message_id", "") or "")
+
+        # 1. 处理引用消息
         quoted_elements = _pop_quoted_elements(msg_id)
         if quoted_elements:
             reply_comp = _parse_quoted_message(quoted_elements)
@@ -340,6 +453,36 @@ def _patch_parse_from_qqofficial() -> None:
                     abm.message_str = (
                         f"[引用消息] {reply_comp.message_str}\n{abm.message_str}"
                     ).strip()
+
+                # 被引用语音消息的 ASR 文本注入 Reply.chain
+                quoted_asr = _extract_asr_from_msg_elements(quoted_elements)
+                if quoted_asr:
+                    for transcript in quoted_asr:
+                        if reply_comp.chain:
+                            reply_comp.chain.append(Plain(f"[语音转文字] {transcript}"))
+                        if reply_comp.message_str:
+                            reply_comp.message_str += f"\n[语音转文字] {transcript}"
+                        else:
+                            reply_comp.message_str = f"[语音转文字] {transcript}"
+                    # 更新 message_str 中的引用标记
+                    if reply_comp.message_str:
+                        abm.message_str = (
+                            f"[引用消息] {reply_comp.message_str}\n{abm.message_str}"
+                        ).strip()
+
+        # 2. 处理当前消息的 QQ 内置 ASR(直接语音消息,非引用)
+        raw_atts = _pop_raw_attachments(msg_id)
+        if raw_atts:
+            asr_transcripts = _extract_asr_from_attachments(raw_atts)
+            if asr_transcripts:
+                # 将 ASR 文本追加到消息链和 message_str
+                for transcript in asr_transcripts:
+                    abm.message.append(Plain(f"[语音转文字] {transcript}"))
+                asr_block = "\n".join(f"[语音转文字] {t}" for t in asr_transcripts)
+                if abm.message_str:
+                    abm.message_str = f"{abm.message_str}\n{asr_block}"
+                else:
+                    abm.message_str = asr_block
 
         return abm
 
@@ -374,7 +517,7 @@ def _patch_webhook_handle_callback(context: Context) -> None:
         return
 
     async def patched_handle_callback(self, request) -> Any:
-        # 在原始处理前,提取 msg_elements
+        # 在原始处理前,提取 msg_elements 和原始 attachments
         try:
             body = await request.get_data()
             if body:
@@ -389,8 +532,13 @@ def _patch_webhook_handle_callback(context: Context) -> None:
                             _store_quoted_elements(
                                 str(msg_id), data.get("msg_elements")
                             )
+                        # 捕获原始 attachments(含 asr_refer_text / voice_wav_url)
+                        if msg_id and data.get("attachments"):
+                            _store_raw_attachments(
+                                str(msg_id), data.get("attachments")
+                            )
         except Exception as e:
-            logger.debug(f"[qqofficial_quote] webhook 提取 msg_elements 失败: {e}")
+            logger.debug(f"[qqofficial_quote] webhook 提取数据失败: {e}")
 
         return await original_handle(self, request)
 
@@ -446,4 +594,6 @@ class QQOfficialQuotePlugin(Star):
         with _cache_lock:
             _quoted_msg_cache.clear()
             _quoted_msg_timestamps.clear()
+            _raw_attachments_cache.clear()
+            _raw_attachments_timestamps.clear()
         logger.info("[qqofficial_quote] 插件已卸载")
