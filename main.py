@@ -486,8 +486,8 @@ def _patch_webhook_handle_callback(context: Context) -> None:
 @register(
     "astrbot_plugin_qqofficial_quote",
     "yuweitk",
-    "QQ官方引用消息+内置ASR语音识别+可配置开关",
-    "0.2.1",
+    "QQ官方引用消息+内置ASR语音识别(配置文件开关)",
+    "0.3.0",
 )
 class QQOfficialQuotePlugin(Star):
     """QQ 官方引用消息 + 内置ASR + 可配置开关
@@ -524,44 +524,18 @@ class QQOfficialQuotePlugin(Star):
             logger.error(f"[qqofficial_quote] 应用 patch 失败: {e}", exc_info=True)
 
     @filter.command("qqquote")
-    async def cmd_qqquote(
-        self, event: AstrMessageEvent, action: str = "", value: str = ""
-    ):
-        """配置命令: /qqquote [config|enable|disable] [quote|asr]"""
-        action = action.strip().lower() if action else ""
-
-        if not action or action == "config":
-            builtin = _detect_builtin_quote()
-            yield event.plain_result(
-                f"【QQ引用+ASR 插件 v0.2.1 配置】\n\n"
-                f"引用消息: {'✅ 启用' if self._config['enable_quote'] else '❌ 关闭'}"
-                f"{' (AstrBot已内置,跳过)' if builtin else ''}\n"
-                f"ASR语音:  {'✅ 启用' if self._config['enable_asr'] else '❌ 关闭'}\n\n"
-                f"切换命令:\n"
-                f"  /qqquote enable quote\n"
-                f"  /qqquote disable quote\n"
-                f"  /qqquote enable asr\n"
-                f"  /qqquote disable asr\n\n"
-                f"⚠️ 修改后需重启 AstrBot 生效"
-            )
-            return
-
-        if action not in ("enable", "disable"):
-            yield event.plain_result("用法: /qqquote [config|enable|disable] [quote|asr]")
-            return
-
-        value = value.strip().lower() if value else ""
-        if value not in ("quote", "asr"):
-            yield event.plain_result(f"请指定: quote 或 asr\n用法: /qqquote {action} quote")
-            return
-
-        key = f"enable_{value}"
-        self._config[key] = (action == "enable")
-        _save_config(self._config)
+    async def cmd_qqquote(self, event: AstrMessageEvent):
+        """查看配置: /qqquote"""
+        builtin = _detect_builtin_quote()
         yield event.plain_result(
-            f"✅ {'引用消息' if value == 'quote' else 'ASR语音识别'} "
-            f"已{'启用' if action == 'enable' else '关闭'}\n"
-            f"⚠️ 请重启 AstrBot 使配置生效"
+            f"【QQ引用+ASR 插件 v0.3.0 配置】\n\n"
+            f"引用消息: {'✅ 启用' if self._config['enable_quote'] else '❌ 关闭'}"
+            f"{' (AstrBot已内置,跳过patch)' if builtin else ''}\n"
+            f"ASR语音:  {'✅ 启用' if self._config['enable_asr'] else '❌ 关闭'}\n\n"
+            f"📁 配置文件: config.json\n"
+            f"  修改 enable_quote / enable_asr 后重启 AstrBot 生效\n"
+            f"  当前值: enable_quote={str(self._config['enable_quote']).lower()}, "
+            f"enable_asr={str(self._config['enable_asr']).lower()}"
         )
 
     async def terminate(self) -> None:
