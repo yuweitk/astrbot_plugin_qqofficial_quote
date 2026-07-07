@@ -1,62 +1,109 @@
 """
-AstrBot 插件: QQ 官方引用消息适配 + QQ内置ASR语音识别
+AstrBot 插件: QQ 官方引用消息适配 + QQ内置ASR语音识别 + 可配置开关
 
-在不修改 AstrBot 源码的前提下,通过 monkey-patch 补全 QQ 官方适配器
-(qq_official / qq_official_webhook)的两项能力:
+功能:
+1. 引用消息(回复消息)解析 —— 将QQ平台推送的msg_elements转为Reply组件
+2. QQ内置ASR语音识别 —— 将asr_refer_text免费转写文本注入消息链
+3. 可配置开关 —— /qqquote enable/disable quote|asr
 
-1. 引用消息(回复消息)解析
-   QQ 官方 API 在用户回复(引用)消息时,推送的 payload 中:
-     - message_type = 103
-     - 被引用消息的内容和附件放在 msg_elements 字段中
-   但 botpy SDK 的消息类使用 __slots__ 限定字段,没有保存 msg_elements,
-   导致这些数据在 SDK 层面就被丢弃了。
-
-2. QQ内置ASR语音识别 (asr_refer_text)
-   QQ 平台对语音消息免费提供腾讯ASR转写结果(asr_refer_text 字段),
-   以及预转WAV URL(voice_wav_url 字段)。
-   但 botpy 的 _Attachments 类 __slots__ 不含这两个字段,同样被丢弃。
-   本插件捕获原始 payload 中的这些字段,将转写文本注入消息链。
-
-本插件通过三层 patch 解决问题:
-  1. patch botpy ConnectionState 的 parser —— 捕获 msg_elements + 原始attachments
-  2. patch QQOfficialWebhook.handle_callback —— Webhook 模式同样捕获
-  3. patch QQOfficialPlatformAdapter._parse_from_qqofficial —— 构造Reply + 注入ASR文本
+AstrBot 4.26.x 已内置引用消息支持(PatchedMessage + msg_elements + Reply构造)。
+本插件在检测到内置支持时自动跳过 quote patch,仅保留 ASR 功能。
 
 参考实现: https://github.com/NousResearch/hermes-agent (gateway/platforms/qqbot)
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 import time
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import filter
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Image, Plain, Record, Video, File
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import BaseMessageComponent, Reply
 
 # ====================================================================
-# 模块级缓存 —— 引用消息 + 原始附件(含ASR)
+# 配置系统
 # ====================================================================
-# message_id -> {msg_elements, raw_attachments}
-# msg_elements: 引用消息的内容(含被引用消息的文本/附件/asr_refer_text)
-# raw_attachments: 当前消息的原始附件列表(含 asr_refer_text / voice_wav_url)
-# botpy parser 在解析 payload 时会丢弃这些字段,
-# 我们在 patched parser 中提前捕获并缓存。
+
+DEFAULT_CONFIG: dict[str, bool] = {
+    "enable_quote": True,
+    "enable_asr": True,
+}
+
+
+def _get_config_path() -> str:
+    """获取配置文件路径"""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "config.json",
+    )
+
+
+def load_config() -> dict[str, bool]:
+    """加载插件配置，不存在则创建默认配置"""
+    path = _get_config_path()
+    if not os.path.exists(path):
+        _save_config(DEFAULT_CONFIG)
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        result = dict(DEFAULT_CONFIG)
+        result.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
+        return result
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def _save_config(cfg: dict[str, bool]) -> None:
+    path = _get_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _detect_builtin_quote() -> bool:
+    """检测 AstrBot 是否已内置引用消息支持"""
+    try:
+        from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import (
+            _ensure_group_message_create_parser,
+        )
+        return callable(_ensure_group_message_create_parser)
+    except (ImportError, AttributeError):
+        pass
+    return False
+
+
+# ====================================================================
+# 全局开关(由 _apply_patches 根据配置设置)
+# ====================================================================
+
+_APPLY_QUOTE = True
+_APPLY_ASR = True
+
+# ====================================================================
+# 模块级缓存
+# ====================================================================
+
 _quoted_msg_cache: dict[str, list] = {}
 _quoted_msg_timestamps: dict[str, float] = {}
 _raw_attachments_cache: dict[str, list] = {}
 _raw_attachments_timestamps: dict[str, float] = {}
 _cache_lock = threading.Lock()
-_CACHE_TTL = 300  # 秒
+_CACHE_TTL = 300
 _CACHE_MAX_SIZE = 500
+
+_patch_applied = False
+_patched_parsers: set[str] = set()
 
 
 def _store_quoted_elements(message_id: str, msg_elements: list | None) -> None:
-    """缓存引用消息的 msg_elements。"""
     if not message_id or not msg_elements:
         return
     with _cache_lock:
@@ -66,7 +113,6 @@ def _store_quoted_elements(message_id: str, msg_elements: list | None) -> None:
 
 
 def _pop_quoted_elements(message_id: str) -> list | None:
-    """取出并移除缓存的 msg_elements(一次性消费)。"""
     if not message_id:
         return None
     with _cache_lock:
@@ -75,7 +121,6 @@ def _pop_quoted_elements(message_id: str) -> list | None:
 
 
 def _store_raw_attachments(message_id: str, attachments: list | None) -> None:
-    """缓存原始附件列表(含 asr_refer_text / voice_wav_url)。"""
     if not message_id or not attachments:
         return
     with _cache_lock:
@@ -85,7 +130,6 @@ def _store_raw_attachments(message_id: str, attachments: list | None) -> None:
 
 
 def _pop_raw_attachments(message_id: str) -> list | None:
-    """取出并移除缓存的原始附件(一次性消费)。"""
     if not message_id:
         return None
     with _cache_lock:
@@ -94,26 +138,18 @@ def _pop_raw_attachments(message_id: str) -> list | None:
 
 
 def _evict_expired_locked() -> None:
-    """清理超过 TTL 的缓存条目(调用方需持有锁)。"""
     total = len(_quoted_msg_cache) + len(_raw_attachments_cache)
     if total <= _CACHE_MAX_SIZE:
         return
     now = time.monotonic()
-    # 清理引用消息缓存
-    expired = [
-        mid for mid, ts in _quoted_msg_timestamps.items() if now - ts > _CACHE_TTL
-    ]
-    for mid in expired:
-        _quoted_msg_cache.pop(mid, None)
-        _quoted_msg_timestamps.pop(mid, None)
-    # 清理原始附件缓存
-    expired2 = [
-        mid for mid, ts in _raw_attachments_timestamps.items() if now - ts > _CACHE_TTL
-    ]
-    for mid in expired2:
-        _raw_attachments_cache.pop(mid, None)
-        _raw_attachments_timestamps.pop(mid, None)
-    # 如果清理后仍超限,直接清空最旧的一半
+    for cache, ts_cache in [
+        (_quoted_msg_cache, _quoted_msg_timestamps),
+        (_raw_attachments_cache, _raw_attachments_timestamps),
+    ]:
+        expired = [mid for mid, ts in ts_cache.items() if now - ts > _CACHE_TTL]
+        for mid in expired:
+            cache.pop(mid, None)
+            ts_cache.pop(mid, None)
     total = len(_quoted_msg_cache) + len(_raw_attachments_cache)
     if total > _CACHE_MAX_SIZE:
         _quoted_msg_cache.clear()
@@ -123,20 +159,15 @@ def _evict_expired_locked() -> None:
 
 
 # ====================================================================
-# QQ 表情消息解析(复刻自 AstrBot qqofficial 适配器)
+# QQ 表情消息解析
 # ====================================================================
 
 _FACE_TAG_RE = re.compile(r"<faceType=\d+[^>]*>")
 
 
 def _parse_face_message(content: str) -> str:
-    """解析 QQ 官方 face message 格式,转换为可读文本。
-
-    格式: <faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+a7oeWktOmXruWPt10ifQ==">
-    ext 字段是 base64 编码的 JSON,含 text 字段描述表情。
-    """
+    """解析 QQ face message, 转换为可读文本"""
     import base64
-    import json
 
     def replace_face(match: re.Match) -> str:
         face_tag = match.group(0)
@@ -169,29 +200,12 @@ def _normalize_attachment_url(url: str | None) -> str:
 
 
 def _parse_quoted_message(msg_elements: list | None) -> Reply | None:
-    """解析 QQ 官方引用消息的 msg_elements,构造 Reply 组件。
-
-    参考 hermes-agent 的 _process_quoted_context 实现。
-
-    QQ 官方 API 在用户回复(引用)消息时,设置 message_type=103,
-    并将被引用消息的内容和附件放在 msg_elements 字段中。
-    每个 element 是 dict,含:
-      - content: str        被引用消息的文本
-      - attachments: list    被引用消息的附件列表
-
-    Args:
-        msg_elements: payload 中的 msg_elements 字段(list[dict])。
-
-    Returns:
-        构造好的 Reply 组件,或 None(无引用内容)。
-    """
+    """解析QQ引用消息的msg_elements, 构造Reply组件"""
     if not msg_elements or not isinstance(msg_elements, list):
         return None
 
     quoted_text_parts: list[str] = []
     quoted_chain: list[BaseMessageComponent] = []
-
-    # 音频/视频/图片扩展名集合
     image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
     audio_exts = {".mp3", ".wav", ".ogg", ".m4a", ".amr", ".silk"}
     video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -199,15 +213,11 @@ def _parse_quoted_message(msg_elements: list | None) -> Reply | None:
     for elem in msg_elements:
         if not isinstance(elem, dict):
             continue
-
-        # 提取引用文本
         etext = str(elem.get("content", "")).strip()
         if etext:
             etext = _parse_face_message(etext)
             quoted_text_parts.append(etext)
             quoted_chain.append(Plain(etext))
-
-        # 提取引用附件
         eatts = elem.get("attachments")
         if isinstance(eatts, list):
             for att in eatts:
@@ -218,10 +228,7 @@ def _parse_quoted_message(msg_elements: list | None) -> Reply | None:
                 if not url:
                     continue
                 filename = att.get("filename") or att.get("name") or "attachment"
-                ext = (
-                    "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-                )
-
+                ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
                 if content_type.startswith("image") or ext in image_exts:
                     quoted_chain.append(Image.fromURL(url))
                 elif content_type.startswith("voice") or ext in audio_exts:
@@ -251,69 +258,30 @@ def _parse_quoted_message(msg_elements: list | None) -> Reply | None:
 
 
 def _extract_asr_from_attachments(raw_attachments: list | None) -> list[str]:
-    """从原始附件列表中提取 QQ 内置 ASR 转写文本。
-
-    QQ 平台对语音消息免费提供腾讯ASR转写结果(asr_refer_text 字段),
-    但 botpy 的 _Attachments 类 __slots__ 不含此字段,导致被丢弃。
-
-    Args:
-        raw_attachments: 原始 payload 中的 attachments 列表(list[dict])
-
-    Returns:
-        转写文本列表(每个语音附件一条)
-    """
+    """从原始附件列表中提取 QQ 内置 ASR 转写文本"""
     if not raw_attachments or not isinstance(raw_attachments, list):
         return []
-
     transcripts: list[str] = []
     audio_exts = {".mp3", ".wav", ".ogg", ".m4a", ".amr", ".silk"}
     audio_cts = ("voice", "audio")
-
     for att in raw_attachments:
         if not isinstance(att, dict):
             continue
-        # 调试：打印每个附件的所有字段名
-        logger.info(
-            f"[qqofficial_quote] attachment keys: {list(att.keys())}, "
-            f"content_type={att.get('content_type', 'N/A')}"
-        )
-        # 检查是否是语音附件
         ct = str(att.get("content_type", "") or "").lower()
         filename = str(att.get("filename", "") or att.get("name", "") or "")
         ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-
         is_voice = ct.startswith(audio_cts) or ext in audio_exts
         if not is_voice:
             continue
-
-        # 提取 QQ 内置 ASR 文本
         asr_text = str(att.get("asr_refer_text", "") or "").strip()
-        logger.info(
-            f"[qqofficial_quote] voice attachment: ct={ct}, filename={filename}, "
-            f"asr_refer_text={'有' if asr_text else '无'}({asr_text[:80]}), "
-            f"voice_wav_url={'有' if att.get('voice_wav_url') else '无'}"
-        )
         if asr_text:
             transcripts.append(asr_text)
-
     return transcripts
 
 
 def _extract_asr_from_msg_elements(msg_elements: list | None) -> list[str]:
-    """从引用消息的 msg_elements 中提取被引用语音消息的 ASR 文本。
-
-    当用户引用一条语音消息时,msg_elements 中的 attachments 可能包含
-    被引用语音的 asr_refer_text。
-
-    Args:
-        msg_elements: 引用消息的 msg_elements 字段
-
-    Returns:
-        转写文本列表
-    """
     if not msg_elements or not isinstance(msg_elements, list):
         return []
-
     transcripts: list[str] = []
     for elem in msg_elements:
         if not isinstance(elem, dict):
@@ -321,7 +289,6 @@ def _extract_asr_from_msg_elements(msg_elements: list | None) -> list[str]:
         eatts = elem.get("attachments")
         if isinstance(eatts, list):
             transcripts.extend(_extract_asr_from_attachments(eatts))
-
     return transcripts
 
 
@@ -329,21 +296,16 @@ def _extract_asr_from_msg_elements(msg_elements: list | None) -> list[str]:
 # Monkey-Patch 引擎
 # ====================================================================
 
-_patch_applied = False
-_patched_parsers: set[str] = set()
 
+def _apply_patches(context: Context, config: dict[str, bool] | None = None) -> None:
+    """应用 monkey-patch, 根据配置跳过节选功能"""
+    if config is None:
+        config = load_config()
 
-def _apply_patches(context: Context) -> None:
-    """应用所有必要的 monkey-patch。
+    global _APPLY_QUOTE, _APPLY_ASR
+    _APPLY_QUOTE = config.get("enable_quote", True) and not _detect_builtin_quote()
+    _APPLY_ASR = config.get("enable_asr", True)
 
-    在 on_platform_loaded 钩子中调用。此时:
-    - 平台适配器已实例化(__init__ 已执行,_ensure_group_message_create_parser 已调用)
-    - inst.run() 作为异步任务已创建但尚未开始执行(asyncio.create_task 不立即执行)
-    - ConnectionSession 尚未创建(在 run() 中创建)
-
-    时序保证:on_platform_loaded 钩子(await handler.handler())在 inst.run() 任务
-    被事件循环调度之前完成,因此 patch 类方法对后续创建的 ConnectionSession 有效。
-    """
     global _patch_applied
     if _patch_applied:
         return
@@ -358,49 +320,39 @@ def _apply_patches(context: Context) -> None:
     except Exception as e:
         logger.warning(f"[qqofficial_quote] patch _parse_from_qqofficial 失败: {e}")
 
-    # Webhook 模式的 handle_callback patch 作为额外保险
-    # (Webhook 模式下 handle_callback 直接处理 HTTP payload,不经过 botpy parser)
-    try:
-        _patch_webhook_handle_callback(context)
-    except Exception as e:
-        logger.warning(f"[qqofficial_quote] patch webhook handle_callback 失败: {e}")
+    if _APPLY_ASR or _APPLY_QUOTE:
+        try:
+            _patch_webhook_handle_callback(context)
+        except Exception as e:
+            logger.warning(f"[qqofficial_quote] patch webhook handle_callback 失败: {e}")
 
     _patch_applied = True
-    logger.info("[qqofficial_quote] 所有 patch 已应用")
+    logger.info(
+        f"[qqofficial_quote] patch 已应用 "
+        f"(quote={'覆盖' if _APPLY_QUOTE else '跳过'}, asr={'启用' if _APPLY_ASR else '关闭'})"
+    )
 
 
 def _patch_connection_state_parsers() -> None:
-    """patch botpy ConnectionState 的所有消息 parser,捕获 msg_elements。
+    """patch botpy ConnectionState 的消息 parser, 捕获 msg_elements + 原始 attachments"""
+    if not _APPLY_ASR and not _APPLY_QUOTE:
+        return
 
-    botpy 的消息类(GroupMessage/C2CMessage/Message/DirectMessage)使用 __slots__
-    限定字段,不含 message_type 和 msg_elements,解析时直接丢弃。
-
-    ConnectionState.__init__ 通过 inspect.getmembers 收集所有 parse_ 方法到
-    self.parsers dict。因此 patch 类方法后,之后创建的 ConnectionState 实例
-    会自动引用 patched 版本。
-
-    对于已存在的实例(竞态情况),额外 patch 实例的 parsers dict。
-    """
     try:
         from botpy.connection import ConnectionState
     except ImportError:
-        logger.warning("[qqofficial_quote] botpy 未安装,跳过 ConnectionState patch")
+        logger.warning("[qqofficial_quote] botpy 未安装, 跳过 ConnectionState patch")
         return
 
-    # 需要 patch 的 parser 事件名
     event_names = [
-        "group_at_message_create",
-        "group_message_create",
-        "c2c_message_create",
-        "at_message_create",
-        "direct_message_create",
+        "group_at_message_create", "group_message_create",
+        "c2c_message_create", "at_message_create", "direct_message_create",
     ]
 
     for event_name in event_names:
         parser_name = f"parse_{event_name}"
         original_parser = getattr(ConnectionState, parser_name, None)
         if original_parser is None:
-            logger.debug(f"[qqofficial_quote] {parser_name} 不存在,跳过")
             continue
         if getattr(original_parser, "_qq_quote_patched", False):
             continue
@@ -409,192 +361,119 @@ def _patch_connection_state_parsers() -> None:
             def wrapped_parser(self, payload: dict[str, Any]) -> Any:
                 d = payload.get("d", {}) or {}
                 msg_id = d.get("id")
-                if msg_id and d.get("msg_elements"):
-                    _store_quoted_elements(str(msg_id), d.get("msg_elements"))
-                # 捕获原始 attachments(含 asr_refer_text / voice_wav_url)
-                raw_atts = d.get("attachments")
-                if msg_id and raw_atts:
-                    # 调试日志：打印原始 attachments 结构
-                    import json as _json
-                    try:
-                        atts_summary = []
-                        for a in (raw_atts if isinstance(raw_atts, list) else []):
-                            if isinstance(a, dict):
-                                atts_summary.append({
-                                    k: (str(v)[:80] if v else v)
-                                    for k, v in a.items()
-                                })
-                        if atts_summary:
-                            logger.info(
-                                f"[qqofficial_quote] {name} raw attachments: "
-                                f"{_json.dumps(atts_summary, ensure_ascii=False)}"
-                            )
-                    except Exception:
-                        logger.info(
-                            f"[qqofficial_quote] {name} raw attachments (raw): "
-                            f"{str(raw_atts)[:500]}"
-                        )
-                    _store_raw_attachments(str(msg_id), raw_atts)
-                # 同时检查 msg_elements 中是否含语音/ASR信息
-                if msg_id and d.get("msg_elements"):
-                    me = d.get("msg_elements")
-                    if isinstance(me, list):
-                        for elem in me:
-                            if isinstance(elem, dict):
-                                ea = elem.get("attachments")
-                                if ea and isinstance(ea, list):
-                                    for a in ea:
-                                        if isinstance(a, dict):
-                                            asr = a.get("asr_refer_text", "")
-                                            if asr:
-                                                logger.info(
-                                                    f"[qqofficial_quote] {name} "
-                                                    f"found asr_refer_text in msg_elements: "
-                                                    f"{str(asr)[:100]}"
-                                                )
+                if msg_id:
+                    if _APPLY_QUOTE and d.get("msg_elements"):
+                        _store_quoted_elements(str(msg_id), d.get("msg_elements"))
+                    if _APPLY_ASR:
+                        raw_atts = d.get("attachments")
+                        if raw_atts:
+                            _store_raw_attachments(str(msg_id), raw_atts)
                 return orig(self, payload)
-
-            wrapped_parser._qq_quote_patched = True  # type: ignore[attr-defined]
+            wrapped_parser._qq_quote_patched = True
             return wrapped_parser
 
         wrapped = _make_wrapper(original_parser)
         setattr(ConnectionState, parser_name, wrapped)
         _patched_parsers.add(parser_name)
-        logger.debug(f"[qqofficial_quote] 已 patch 类方法 {parser_name}")
 
 
 def _patch_parse_from_qqofficial() -> None:
-    """patch QQOfficialPlatformAdapter._parse_from_qqofficial,注入 Reply 组件。
+    """patch QQOfficialPlatformAdapter._parse_from_qqofficial, 注入 Reply + ASR"""
+    if not _APPLY_ASR and not _APPLY_QUOTE:
+        return
 
-    在原始方法返回 abm 后,查询缓存获取 msg_elements,
-    构造 Reply 组件并插入消息链头部。
-    """
     try:
         from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import (
             QQOfficialPlatformAdapter,
         )
     except ImportError:
-        logger.warning(
-            "[qqofficial_quote] 无法导入 QQOfficialPlatformAdapter,跳过 patch"
-        )
+        logger.warning("[qqofficial_quote] 无法导入 QQOfficialPlatformAdapter, 跳过 patch")
         return
 
     original_parse = QQOfficialPlatformAdapter._parse_from_qqofficial
-
     if getattr(original_parse, "_qq_quote_patched", False):
         return
 
     async def patched_parse(message, message_type, force_group_mention=False):
         abm = await original_parse(message, message_type, force_group_mention)
-
         msg_id = str(getattr(abm, "message_id", "") or "")
 
-        # 1. 处理引用消息
-        quoted_elements = _pop_quoted_elements(msg_id)
-        if quoted_elements:
-            reply_comp = _parse_quoted_message(quoted_elements)
-            if reply_comp:
-                # 将 Reply 组件插入消息链头部(与 aiocqhttp 适配器保持一致)
-                abm.message.insert(0, reply_comp)
-                # 在 message_str 中追加引用标记
-                if reply_comp.message_str:
-                    abm.message_str = (
-                        f"[引用消息] {reply_comp.message_str}\n{abm.message_str}"
-                    ).strip()
-
-                # 被引用语音消息的 ASR 文本注入 Reply.chain
-                quoted_asr = _extract_asr_from_msg_elements(quoted_elements)
-                if quoted_asr:
-                    for transcript in quoted_asr:
-                        if reply_comp.chain:
-                            reply_comp.chain.append(Plain(f"[语音转文字] {transcript}"))
-                        if reply_comp.message_str:
-                            reply_comp.message_str += f"\n[语音转文字] {transcript}"
-                        else:
-                            reply_comp.message_str = f"[语音转文字] {transcript}"
-                    # 更新 message_str 中的引用标记
+        # 1. 引用消息
+        if _APPLY_QUOTE:
+            quoted_elements = _pop_quoted_elements(msg_id)
+            if quoted_elements:
+                reply_comp = _parse_quoted_message(quoted_elements)
+                if reply_comp:
+                    abm.message.insert(0, reply_comp)
                     if reply_comp.message_str:
                         abm.message_str = (
                             f"[引用消息] {reply_comp.message_str}\n{abm.message_str}"
                         ).strip()
+                    # 被引用语音 ASR
+                    if _APPLY_ASR:
+                        quoted_asr = _extract_asr_from_msg_elements(quoted_elements)
+                        for transcript in quoted_asr:
+                            if reply_comp.chain:
+                                reply_comp.chain.append(Plain(f"[语音转文字] {transcript}"))
+                            if reply_comp.message_str:
+                                reply_comp.message_str += f"\n[语音转文字] {transcript}"
+                            else:
+                                reply_comp.message_str = f"[语音转文字] {transcript}"
 
-        # 2. 处理当前消息的 QQ 内置 ASR(直接语音消息,非引用)
-        raw_atts = _pop_raw_attachments(msg_id)
-        if raw_atts:
-            logger.info(
-                f"[qqofficial_quote] msg_id={msg_id} "
-                f"raw_attachments count={len(raw_atts)}"
-            )
-            asr_transcripts = _extract_asr_from_attachments(raw_atts)
-            if asr_transcripts:
-                # 将 ASR 文本追加到消息链和 message_str
-                for transcript in asr_transcripts:
-                    abm.message.append(Plain(f"[语音转文字] {transcript}"))
-                asr_block = "\n".join(f"[语音转文字] {t}" for t in asr_transcripts)
-                if abm.message_str:
-                    abm.message_str = f"{abm.message_str}\n{asr_block}"
-                else:
-                    abm.message_str = asr_block
+        # 2. 直接语音 ASR
+        if _APPLY_ASR:
+            raw_atts = _pop_raw_attachments(msg_id)
+            if raw_atts:
+                asr_transcripts = _extract_asr_from_attachments(raw_atts)
+                if asr_transcripts:
+                    for transcript in asr_transcripts:
+                        abm.message.append(Plain(f"[语音转文字] {transcript}"))
+                    asr_block = "\n".join(f"[语音转文字] {t}" for t in asr_transcripts)
+                    if abm.message_str:
+                        abm.message_str = f"{abm.message_str}\n{asr_block}"
+                    else:
+                        abm.message_str = asr_block
 
         return abm
 
-    patched_parse._qq_quote_patched = True  # type: ignore[attr-defined]
+    patched_parse._qq_quote_patched = True
     QQOfficialPlatformAdapter._parse_from_qqofficial = staticmethod(patched_parse)
     logger.info("[qqofficial_quote] 已 patch _parse_from_qqofficial")
 
 
 def _patch_webhook_handle_callback(context: Context) -> None:
-    """patch QQOfficialWebhook.handle_callback,捕获 msg_elements。
-
-    Webhook 模式下,handle_callback 直接处理 HTTP payload。虽然 webhook 模式
-    也通过 ConnectionState parser 解析消息(类方法 patch 已覆盖),但这里作为
-    额外保险,在 HTTP 入口处直接提取 msg_elements。
-
-    注意: FastAPI/Starlette 的 Request.body()/get_data() 会缓存 body,
-    多次调用是安全的。
-    """
+    """patch QQOfficialWebhook.handle_callback, 在 HTTP 入口捕获原始 payload"""
     try:
         from astrbot.core.platform.sources.qqofficial_webhook.qo_webhook_server import (
             QQOfficialWebhook,
         )
     except ImportError:
-        logger.warning(
-            "[qqofficial_quote] 无法导入 QQOfficialWebhook,跳过 webhook patch"
-        )
+        logger.warning("[qqofficial_quote] 无法导入 QQOfficialWebhook, 跳过 webhook patch")
         return
 
     original_handle = QQOfficialWebhook.handle_callback
-
     if getattr(original_handle, "_qq_quote_patched", False):
         return
 
     async def patched_handle_callback(self, request) -> Any:
-        # 在原始处理前,提取 msg_elements 和原始 attachments
         try:
             body = await request.get_data()
             if body:
-                import json
-
                 msg = json.loads(body.decode("utf-8"))
                 if isinstance(msg, dict):
                     data = msg.get("d") or {}
                     if isinstance(data, dict):
                         msg_id = data.get("id")
-                        if msg_id and data.get("msg_elements"):
-                            _store_quoted_elements(
-                                str(msg_id), data.get("msg_elements")
-                            )
-                        # 捕获原始 attachments(含 asr_refer_text / voice_wav_url)
-                        if msg_id and data.get("attachments"):
-                            _store_raw_attachments(
-                                str(msg_id), data.get("attachments")
-                            )
-        except Exception as e:
-            logger.debug(f"[qqofficial_quote] webhook 提取数据失败: {e}")
-
+                        if msg_id:
+                            if _APPLY_QUOTE and data.get("msg_elements"):
+                                _store_quoted_elements(str(msg_id), data.get("msg_elements"))
+                            if _APPLY_ASR and data.get("attachments"):
+                                _store_raw_attachments(str(msg_id), data.get("attachments"))
+        except Exception:
+            pass
         return await original_handle(self, request)
 
-    patched_handle_callback._qq_quote_patched = True  # type: ignore[attr-defined]
+    patched_handle_callback._qq_quote_patched = True
     QQOfficialWebhook.handle_callback = patched_handle_callback
     logger.info("[qqofficial_quote] 已 patch QQOfficialWebhook.handle_callback")
 
@@ -607,40 +486,85 @@ def _patch_webhook_handle_callback(context: Context) -> None:
 @register(
     "astrbot_plugin_qqofficial_quote",
     "yuweitk",
-    "为 QQ 官方适配器补全群聊/私聊引用消息(回复消息)的解析能力",
-    "0.1.0",
+    "QQ官方引用消息+内置ASR语音识别+可配置开关",
+    "0.2.1",
 )
 class QQOfficialQuotePlugin(Star):
-    """QQ 官方引用消息适配插件。
+    """QQ 官方引用消息 + 内置ASR + 可配置开关
 
-    通过 monkey-patch 在不修改 AstrBot 源码的前提下,补全 QQ 官方适配器
-    对引用消息的解析能力。QQ 平台推送的引用消息内容(msg_elements)会被
-    转换为 AstrBot 标准 Reply 组件,使机器人能感知用户引用了什么内容。
+    功能:
+    1. 引用消息解析(覆盖/增强 AstrBot 内置实现)
+    2. QQ内置ASR语音识别(asr_refer_text 免费转写)
+    3. /qqquote config 实时开关各项功能
+
+    注意: AstrBot 4.26.x 已内置引用消息支持,
+    本插件会自动检测并跳过重复的 quote patch。
     """
 
     def __init__(self, context: Context) -> None:
         super().__init__(context)
+        self._config: dict[str, bool] = dict(DEFAULT_CONFIG)
 
     async def initialize(self) -> None:
-        """插件初始化,注册说明信息。"""
-        logger.info("[qqofficial_quote] 插件已加载,等待平台就绪后自动应用 patch...")
+        self._config = load_config()
+        builtin = _detect_builtin_quote()
+        logger.info(
+            f"[qqofficial_quote] v0.2.1 已加载 "
+            f"(quote={'启用' if self._config['enable_quote'] else '关闭'}, "
+            f"asr={'启用' if self._config['enable_asr'] else '关闭'}, "
+            f"AstrBot内置quote={'是' if builtin else '否'})"
+        )
 
     @filter.on_platform_loaded()
     async def _on_platform_loaded(self) -> None:
-        """平台加载完成时应用 monkey-patch。
-
-        此时平台适配器已实例化但可能尚未开始运行,是 patch 的最佳时机。
-        """
+        self._config = load_config()
         try:
-            _apply_patches(self.context)
+            _apply_patches(self.context, self._config)
         except Exception as e:
-            logger.error(
-                f"[qqofficial_quote] 应用 patch 失败: {e}",
-                exc_info=True,
+            logger.error(f"[qqofficial_quote] 应用 patch 失败: {e}", exc_info=True)
+
+    @filter.command("qqquote")
+    async def cmd_qqquote(
+        self, event: AstrMessageEvent, action: str = "", value: str = ""
+    ):
+        """配置命令: /qqquote [config|enable|disable] [quote|asr]"""
+        action = action.strip().lower() if action else ""
+
+        if not action or action == "config":
+            builtin = _detect_builtin_quote()
+            yield event.plain_result(
+                f"【QQ引用+ASR 插件 v0.2.1 配置】\n\n"
+                f"引用消息: {'✅ 启用' if self._config['enable_quote'] else '❌ 关闭'}"
+                f"{' (AstrBot已内置,跳过)' if builtin else ''}\n"
+                f"ASR语音:  {'✅ 启用' if self._config['enable_asr'] else '❌ 关闭'}\n\n"
+                f"切换命令:\n"
+                f"  /qqquote enable quote\n"
+                f"  /qqquote disable quote\n"
+                f"  /qqquote enable asr\n"
+                f"  /qqquote disable asr\n\n"
+                f"⚠️ 修改后需重启 AstrBot 生效"
             )
+            return
+
+        if action not in ("enable", "disable"):
+            yield event.plain_result("用法: /qqquote [config|enable|disable] [quote|asr]")
+            return
+
+        value = value.strip().lower() if value else ""
+        if value not in ("quote", "asr"):
+            yield event.plain_result(f"请指定: quote 或 asr\n用法: /qqquote {action} quote")
+            return
+
+        key = f"enable_{value}"
+        self._config[key] = (action == "enable")
+        _save_config(self._config)
+        yield event.plain_result(
+            f"✅ {'引用消息' if value == 'quote' else 'ASR语音识别'} "
+            f"已{'启用' if action == 'enable' else '关闭'}\n"
+            f"⚠️ 请重启 AstrBot 使配置生效"
+        )
 
     async def terminate(self) -> None:
-        """插件卸载时清理。"""
         global _patch_applied
         _patch_applied = False
         with _cache_lock:
