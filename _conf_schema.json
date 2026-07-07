@@ -1,0 +1,14 @@
+{
+  "enable_quote": {
+    "description": "启用引用消息解析",
+    "type": "bool",
+    "hint": "将QQ平台的msg_elements转换为AstrBot标准Reply组件。AstrBot 4.26.x已内置此功能时自动跳过。",
+    "default": true
+  },
+  "enable_asr": {
+    "description": "启用QQ内置ASR语音转文字",
+    "type": "bool",
+    "hint": "QQ平台对语音消息免费提供腾讯ASR转写结果(asr_refer_text)，零配置即可识别语音消息内容。",
+    "default": true
+  }
+}
