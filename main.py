@@ -47,6 +47,7 @@ def _detect_builtin_quote() -> bool:
 
 _APPLY_QUOTE = True
 _APPLY_ASR = True
+_HAS_RAW_DATA = False  # AstrBot PatchedMessage 是否有 raw_data
 
 # ====================================================================
 # 模块级缓存
@@ -247,20 +248,28 @@ def _extract_asr_from_msg_elements(msg_elements: list | None) -> list[str]:
 def _apply_patches(context: Context, config: dict | None = None) -> None:
     if config is None:
         config = {"enable_quote": True, "enable_asr": True}
-    global _APPLY_QUOTE, _APPLY_ASR
+    global _APPLY_QUOTE, _APPLY_ASR, _HAS_RAW_DATA
     _APPLY_QUOTE = bool(config.get("enable_quote", True)) and not _detect_builtin_quote()
     _APPLY_ASR = bool(config.get("enable_asr", True))
+    _HAS_RAW_DATA = _detect_builtin_quote()  # PatchedMessage 有 raw_data
     global _patch_applied
     if _patch_applied:
         return
-    try:
-        _patch_connection_state_parsers()
-    except Exception as e:
-        logger.warning(f"[qqofficial_quote] parser patch 失败: {e}")
+    # parser patch：仅在需要 quote 或（需要 ASR 且无 raw_data）时应用
+    need_parser = _APPLY_QUOTE or (_APPLY_ASR and not _HAS_RAW_DATA)
+    if need_parser:
+        try:
+            _patch_connection_state_parsers()
+        except Exception as e:
+            logger.warning(f"[qqofficial_quote] parser patch 失败: {e}")
+    else:
+        logger.info("[qqofficial_quote] 跳过 parser patch (AstrBot 已原生保留 raw_data)")
+    # parse patch：总是 patch（ASR 从 raw_data 直接读，不需要缓存）
     try:
         _patch_parse_from_qqofficial()
     except Exception as e:
         logger.warning(f"[qqofficial_quote] _parse_from_qqofficial patch 失败: {e}")
+    # webhook patch：webhook 模式仍需额外捕获
     if _APPLY_ASR or _APPLY_QUOTE:
         try:
             _patch_webhook_handle_callback(context)
@@ -269,7 +278,8 @@ def _apply_patches(context: Context, config: dict | None = None) -> None:
     _patch_applied = True
     logger.info(
         f"[qqofficial_quote] patch 已应用 "
-        f"(quote={'覆盖' if _APPLY_QUOTE else '跳过'}, asr={'启用' if _APPLY_ASR else '关闭'})"
+        f"(quote={'覆盖' if _APPLY_QUOTE else '跳过'}, "
+        f"asr={'启用(raw_data)' if _APPLY_ASR and _HAS_RAW_DATA else '启用(cache)' if _APPLY_ASR else '关闭'})"
     )
 
 
@@ -322,6 +332,8 @@ def _patch_parse_from_qqofficial() -> None:
     async def patched(message, msg_type, force_group_mention=False):
         abm = await orig(message, msg_type, force_group_mention)
         mid = str(getattr(abm, "message_id", "") or "")
+
+        # 1. 引用消息（从缓存，仅当未内置时）
         if _APPLY_QUOTE:
             qe = _pop_quoted_elements(mid)
             if qe:
@@ -334,10 +346,21 @@ def _patch_parse_from_qqofficial() -> None:
                         for t in _extract_asr_from_msg_elements(qe):
                             rc.chain.append(Plain(f"[语音转文字] {t}"))
                             rc.message_str = (rc.message_str or "") + f"\n[语音转文字] {t}"
+
+        # 2. ASR 语音转文字
         if _APPLY_ASR:
-            ra = _pop_raw_attachments(mid)
-            if ra:
-                ts = _extract_asr_from_attachments(ra)
+            raw_atts = None
+            # 新 AstrBot: 直接从 message.raw_data 读取，无需缓存
+            if _HAS_RAW_DATA:
+                raw_data = getattr(message, "raw_data", None)
+                if isinstance(raw_data, dict):
+                    raw_atts = raw_data.get("attachments")
+            else:
+                # 旧 AstrBot: 从缓存获取
+                raw_atts = _pop_raw_attachments(mid)
+
+            if raw_atts:
+                ts = _extract_asr_from_attachments(raw_atts)
                 if ts:
                     for t in ts:
                         abm.message.append(Plain(f"[语音转文字] {t}"))
@@ -350,6 +373,10 @@ def _patch_parse_from_qqofficial() -> None:
 
 
 def _patch_webhook_handle_callback(context: Context) -> None:
+    """patch QQOfficialWebhook.handle_callback。
+    Webhook 模式下在 HTTP 入口提前捕获原始 payload。
+    消息对象仍可能有 raw_data，但为兼容性也同时走缓存路径。
+    """
     try:
         from astrbot.core.platform.sources.qqofficial_webhook.qo_webhook_server import (
             QQOfficialWebhook,
@@ -388,7 +415,7 @@ def _patch_webhook_handle_callback(context: Context) -> None:
     "astrbot_plugin_qqofficial_quote",
     "yuweitk",
     "QQ官方引用消息+内置ASR语音识别",
-    "0.3.0",
+    "0.4.0",
 )
 class QQOfficialQuotePlugin(Star):
 
@@ -402,7 +429,7 @@ class QQOfficialQuotePlugin(Star):
     async def initialize(self) -> None:
         builtin = _detect_builtin_quote()
         logger.info(
-            f"[qqofficial_quote] v0.3.0 已加载 "
+            f"[qqofficial_quote] v0.4.0 已加载 "
             f"(quote={'启用' if self.config.get('enable_quote', True) else '关闭'}, "
             f"asr={'启用' if self.config.get('enable_asr', True) else '关闭'}, "
             f"AstrBot内置quote={'是' if builtin else '否'})"
@@ -422,7 +449,7 @@ class QQOfficialQuotePlugin(Star):
         eq = self.config.get("enable_quote", True)
         ea = self.config.get("enable_asr", True)
         yield event.plain_result(
-            f"【QQ引用+ASR 插件 v0.3.0 配置】\n\n"
+            f"【QQ引用+ASR 插件 v0.4.0 配置】\n\n"
             f"引用消息: {'✅ 启用' if eq else '❌ 关闭'}"
             f"{' (AstrBot已内置,跳过patch)' if builtin and eq else ''}\n"
             f"ASR语音:  {'✅ 启用' if ea else '❌ 关闭'}\n\n"
